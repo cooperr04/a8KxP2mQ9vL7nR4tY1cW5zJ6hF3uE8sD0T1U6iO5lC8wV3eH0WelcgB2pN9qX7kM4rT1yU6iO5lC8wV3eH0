@@ -1,8 +1,5 @@
 name: ytdl-web & Cloudflare Tunnel (Windows RDP Loop) - by Redwanul Haque
 # Suggested filename: ytdl-web-cloudflare-tunnel.yml
-# 🔀 Hybrid Tunnel Mode:
-#    Set CLOUDFLARE_TUNNEL_TOKEN_YTDL + YTDL_WEB_URL secrets → permanent named tunnel
-#    Leave them unset                                         → free random trycloudflare.com URL
 
 on:
   workflow_dispatch:
@@ -200,19 +197,10 @@ jobs:
           Write-Host "✅ Tailscale connected: $tsIP"
 
       # ───────────────────────────────────────────────
-      # Step 5: Setup ytdl-web & Cloudflare Tunnel (Hybrid)
+      # Step 5: Setup ytdl-web & Random Cloudflare Tunnel
       # ───────────────────────────────────────────────
-      # 🔀 HYBRID MODE:
-      #   • If CLOUDFLARE_TUNNEL_TOKEN_YTDL + YTDL_WEB_URL secrets are set
-      #     → uses your PERMANENT named tunnel (fixed domain every run)
-      #   • Otherwise → falls back to the free random trycloudflare.com URL
-      #     from start.bat (no Cloudflare account needed)
-      # ───────────────────────────────────────────────
-      - name: 🚀 Setup ytdl-web & Cloudflare Tunnel (Hybrid)
+      - name: 🚀 Setup ytdl-web & Random Cloudflare Tunnel
         id: ytdlweb-cf
-        env:
-          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN_YTDL }}
-          YTDL_WEB_URL: ${{ secrets.YTDL_WEB_URL }}
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -240,6 +228,11 @@ jobs:
           $appDir = $batFile.DirectoryName
           Write-Host "▶️ Starting ytdl-web via $($batFile.FullName)..."
           Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"`"$($batFile.FullName)`" > `"$appLog`" 2>&1`"" -WorkingDirectory $appDir -WindowStyle Hidden
+
+          # ℹ️ start.bat builds the venv, installs requirements, starts app.py on
+          #    http://127.0.0.1:8080 and opens its OWN temporary trycloudflare.com
+          #    quick tunnel - no Cloudflare account, no token, no fixed domain.
+          #    The URL is random on every run and is scraped from the log below.
 
           # 2. Wait for ytdl-web HTTP port 8080 to become active
           #    (venv creation + pip install on a fresh runner can take a few minutes)
@@ -271,182 +264,81 @@ jobs:
               }
           }
 
-          # ─────────────────────────────────────────────────────────────────
-          # 3. HYBRID TUNNEL LOGIC
-          # ─────────────────────────────────────────────────────────────────
-          $usePermanent = (-not [string]::IsNullOrWhiteSpace($env:CLOUDFLARE_TUNNEL_TOKEN)) -and
-                          (-not [string]::IsNullOrWhiteSpace($env:YTDL_WEB_URL))
-
-          $cfUrlResult = $null
-
-          if ($usePermanent) {
-              # ── BRANCH A: Named / Permanent Tunnel ──────────────────────
-              Write-Host "🔒 CLOUDFLARE_TUNNEL_TOKEN_YTDL & YTDL_WEB_URL are set."
-              Write-Host "🌐 Using PERMANENT named Cloudflare Tunnel..."
-
+          # 3. Capture the random trycloudflare.com URL that start.bat's own
+          #    quick tunnel publishes ("Public URL : https://xxxx.trycloudflare.com")
+          function Read-LogSafe {
+              param([string]$Path)
+              if (-not (Test-Path $Path)) { return "" }
               try {
-                  $permanentUri = [Uri]$env:YTDL_WEB_URL
-              } catch {
-                  throw "YTDL_WEB_URL must be a valid HTTPS URL. Got: $($env:YTDL_WEB_URL)"
-              }
-              if ($permanentUri.Scheme -ne "https" -or -not $permanentUri.Host) {
-                  throw "YTDL_WEB_URL must be a valid HTTPS URL. Got: $($env:YTDL_WEB_URL)"
-              }
-              $cfUrlResult = $permanentUri.AbsoluteUri.TrimEnd("/")
+                  $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+                  try {
+                      $sr = New-Object System.IO.StreamReader($fs)
+                      return $sr.ReadToEnd()
+                  } finally { $fs.Close() }
+              } catch { return "" }
+          }
 
-              # Download cloudflared to a dedicated path
-              $cfBinDir = "$env:ProgramData\cloudflared"
-              $cfExe    = "$cfBinDir\cloudflared.exe"
-              if (-not (Test-Path $cfExe)) {
-                  New-Item -ItemType Directory -Force -Path $cfBinDir | Out-Null
-                  $cfBinUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-                  Write-Host "⬇️ Downloading cloudflared..."
-                  Invoke-WebRequest -Uri $cfBinUrl -OutFile $cfExe -UseBasicParsing
-              }
-              Write-Host "✅ cloudflared binary ready at: $cfExe"
-
-              # ⚠️ Kill ONLY start.bat's cloudflared quick-tunnel process.
-              # start.bat runs: cloudflared tunnel --url http://localhost:8080
-              # We identify it by "--url" in its command line, so we don't
-              # accidentally kill unrelated cloudflared processes.
-              Write-Host "🛑 Stopping start.bat's cloudflared quick-tunnel (--url) process..."
-              Get-WmiObject Win32_Process -Filter "Name='cloudflared.exe'" -ErrorAction SilentlyContinue |
-                  Where-Object { $_.CommandLine -match '--url' } |
-                  ForEach-Object {
-                      Write-Host "   Killing PID $($_.ProcessId): $($_.CommandLine)"
-                      Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-                  }
+          Write-Host "🌐 Waiting for the random trycloudflare.com quick tunnel URL..."
+          $cfUrlResult = $null
+          for ($i = 1; $i -le 150; $i++) {
               Start-Sleep -Seconds 2
-              Write-Host "✅ start.bat's quick-tunnel cloudflared stopped. app.py continues running."
 
-              # Start the named tunnel connector with its own log file
-              $cfLog = "$env:TEMP\cloudflared-named.log"
-              if (Test-Path $cfLog) { Remove-Item $cfLog -Force }
-
-              Write-Host "🚀 Connecting named tunnel → $cfUrlResult ..."
-              $cfArguments = @(
-                  "tunnel",
-                  "--no-autoupdate",
-                  "--logfile", $cfLog,
-                  "run",
-                  "--token", $env:CLOUDFLARE_TUNNEL_TOKEN
-              )
-              $cfProcess = Start-Process -FilePath $cfExe -ArgumentList $cfArguments -WindowStyle Hidden -PassThru
-
-              # Wait for registration confirmation (up to 90 seconds)
-              # Matches all cloudflared log variants: "Registered tunnel connection",
-              # "registered tunnel connection", "INF Registered tunnel", "conns=1"
-              $tunnelReady = $false
-              for ($i = 1; $i -le 45; $i++) {
-                  Start-Sleep -Seconds 2
-                  if ($cfProcess.HasExited) {
-                      Write-Host "⚠️ cloudflared process exited early (attempt $i). Log:"
-                      if (Test-Path $cfLog) { Get-Content $cfLog -Tail 20 | Write-Host }
-                      break
-                  }
-                  if (Test-Path $cfLog) {
-                      $logContent = Get-Content -Path $cfLog -Raw -ErrorAction SilentlyContinue
-                      if ($logContent -match '(?i)(Registered tunnel connection|registered tunnel|conns=1|Connection \d+ registered)') {
-                          $tunnelReady = $true
-                          Write-Host "✅ Named tunnel registered (attempt $i)."
-                          break
-                      }
-                  }
+              # a) launcher log (start.bat prints the URL)
+              $text = Read-LogSafe $appLog
+              if ($text -and $text -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
+                  $cfUrlResult = $Matches[0]
               }
 
-              if (-not $tunnelReady) {
-                  Write-Host "❌ Named Cloudflare Tunnel failed to register after 90s. Log:"
-                  if (Test-Path $cfLog) { Get-Content $cfLog -Tail 30 | Write-Host }
-                  Write-Host "⚠️ Falling back to free quick tunnel..."
-                  $usePermanent = $false   # trigger fallback below
-              } else {
-                  Write-Host ""
-                  Write-Host "================================================================="
-                  Write-Host "🌐 PERMANENT YTDL-WEB URL: $cfUrlResult"
-                  Write-Host "================================================================="
-                  Write-Host ""
-              }
-          }
-
-          if (-not $usePermanent) {
-              # ── BRANCH B: Free Quick Tunnel (trycloudflare.com) ─────────
-              Write-Host "🔓 No permanent tunnel token set (or registration failed)."
-              Write-Host "🌐 Falling back to free random trycloudflare.com URL from start.bat..."
-
-              function Read-LogSafe {
-                  param([string]$Path)
-                  if (-not (Test-Path $Path)) { return "" }
-                  try {
-                      $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-                      try {
-                          $sr = New-Object System.IO.StreamReader($fs)
-                          return $sr.ReadToEnd()
-                      } finally { $fs.Close() }
-                  } catch { return "" }
-              }
-
-              $cfUrlResult = $null
-              for ($i = 1; $i -le 150; $i++) {
-                  Start-Sleep -Seconds 2
-
-                  # a) launcher log
-                  $text = Read-LogSafe $appLog
-                  if ($text -and $text -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
-                      $cfUrlResult = $Matches[0]
-                  }
-
-                  # b) fallback: cloudflared logs that start.bat writes into TEMP
-                  if (-not $cfUrlResult) {
-                      $cfLogs = Get-ChildItem -Path $env:TEMP -Filter "ytdl_cf_*.log" -ErrorAction SilentlyContinue |
-                          Sort-Object LastWriteTime -Descending | Select-Object -First 2
-                      foreach ($lf in $cfLogs) {
-                          $t = Read-LogSafe $lf.FullName
-                          if ($t -and $t -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
-                              $cfUrlResult = $Matches[0]
-                              break
-                          }
-                      }
-                  }
-
-                  if ($cfUrlResult) {
-                      Write-Host "✅ Random public URL obtained (attempt $i): $cfUrlResult"
-                      break
-                  }
-              }
-
+              # b) fallback: cloudflared logs that start.bat writes into TEMP
               if (-not $cfUrlResult) {
-                  Write-Host "❌ Could not capture the trycloudflare.com URL. Log preview:"
-                  if (Test-Path $appLog) {
-                      Get-Content -Path $appLog -Tail 40 -ErrorAction SilentlyContinue | Write-Host
-                  }
-                  exit 1
-              }
-
-              # Verify the public URL responds
-              $publicReady = $false
-              for ($i = 1; $i -le 20; $i++) {
-                  try {
-                      $pub = Invoke-WebRequest -Uri $cfUrlResult -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
-                      if ($pub.StatusCode -ge 200 -and $pub.StatusCode -lt 500) {
-                          $publicReady = $true
-                          Write-Host "✅ Public URL responding (HTTP $($pub.StatusCode))."
+                  $cfLogs = Get-ChildItem -Path $env:TEMP -Filter "ytdl_cf_*.log" -ErrorAction SilentlyContinue |
+                      Sort-Object LastWriteTime -Descending | Select-Object -First 2
+                  foreach ($lf in $cfLogs) {
+                      $t = Read-LogSafe $lf.FullName
+                      if ($t -and $t -match 'https://[a-zA-Z0-9-]+\.trycloudflare\.com') {
+                          $cfUrlResult = $Matches[0]
                           break
                       }
-                  } catch {
-                      Start-Sleep -Seconds 5
                   }
               }
-              if (-not $publicReady) {
-                  Write-Host "⚠️ Public URL not responding yet - tunnel is up, DNS may still be propagating."
-              }
 
-              Write-Host ""
-              Write-Host "================================================================="
-              Write-Host "🌐 RANDOM YTDL-WEB URL: $cfUrlResult"
-              Write-Host "================================================================="
-              Write-Host ""
+              if ($cfUrlResult) {
+                  Write-Host "✅ Random public URL obtained (attempt $i): $cfUrlResult"
+                  break
+              }
           }
 
+          if (-not $cfUrlResult) {
+              Write-Host "❌ Could not capture the trycloudflare.com URL. Log preview:"
+              if (Test-Path $appLog) {
+                  Get-Content -Path $appLog -Tail 40 -ErrorAction SilentlyContinue | Write-Host
+              }
+              exit 1
+          }
+
+          # 4. Wait until the public URL actually answers (edge/DNS propagation)
+          $publicReady = $false
+          for ($i = 1; $i -le 20; $i++) {
+              try {
+                  $pub = Invoke-WebRequest -Uri $cfUrlResult -UseBasicParsing -TimeoutSec 15 -ErrorAction Stop
+                  if ($pub.StatusCode -ge 200 -and $pub.StatusCode -lt 500) {
+                      $publicReady = $true
+                      Write-Host "✅ Public URL responding (HTTP $($pub.StatusCode))."
+                      break
+                  }
+              } catch {
+                  Start-Sleep -Seconds 5
+              }
+          }
+          if (-not $publicReady) {
+              Write-Host "⚠️ Public URL not responding yet - tunnel is up, DNS may still be propagating."
+          }
+
+          Write-Host ""
+          Write-Host "================================================================="
+          Write-Host "🌐 RANDOM YTDL-WEB URL: $cfUrlResult"
+          Write-Host "================================================================="
+          Write-Host ""
           "CF_TUNNEL_URL=$cfUrlResult" | Out-File -Append $env:GITHUB_ENV
 
       # ───────────────────────────────────────────────
@@ -463,9 +355,8 @@ jobs:
               $nl = "`n"
               $message  = "🖥️ <b>ytdl-web Server Ready!</b>" + $nl
               $message += "━━━━━━━━━━━━━━━━━━━━" + $nl
-              $urlMode = if ($env:CF_TUNNEL_URL -notmatch 'trycloudflare\.com') { "🔒 Permanent URL (named tunnel)" } else { "🔁 Random URL (free quick tunnel)" }
               $message += "🌐 Web URL: <code>$($env:CF_TUNNEL_URL)</code>" + $nl
-              $message += "$urlMode" + $nl
+              $message += "🔁 New random URL every run" + $nl
               $message += "🖥️ RDP Address: <code>$($env:TS_IP)</code>" + $nl
               $message += "👤 Username: <code>$($env:RDP_USER)</code>" + $nl
               $message += "🔑 Password: <code>$($env:RDP_PASS)</code>" + $nl
